@@ -1,0 +1,15 @@
+{
+  "name": "d7-ranger-gps-relay",
+  "version": "1.0.0",
+  "description": "Live relay for D7 Ranger Kiosk GPS spoofer status — laptops POST /report, dashboard clients hold a WS /dashboard connection",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
