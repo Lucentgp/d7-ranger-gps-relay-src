@@ -40,6 +40,45 @@ const SENDER_GITHUB_TOKEN   = process.env.SENDER_GITHUB_TOKEN || null; // fleet-
 // responses carry real secrets, so this is deliberately not "*".
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://lucentgp.github.io';
 
+// ── TeamViewer device lookup — fetched server-side only, never exposed
+// to the browser. Devices are matched to laptops by hostname prefix
+// (TeamViewer's alias convention here is "HOSTNAME-truck-serial", e.g.
+// "HW538173-753-0DTTA19403"), so this works with zero laptop-side code:
+// no fleet rollout needed for a laptop to start showing a Remote In
+// link, just this relay knowing the token.
+const TEAMVIEWER_API_TOKEN = process.env.TEAMVIEWER_API_TOKEN || null;
+const TEAMVIEWER_REFRESH_MS = 5 * 60 * 1000;
+let tvDevices = [];
+
+async function refreshTeamViewerDevices() {
+  if (!TEAMVIEWER_API_TOKEN) return;
+  try {
+    const res = await fetch('https://webapi.teamviewer.com/api/v1/devices', {
+      headers: { Authorization: 'Bearer ' + TEAMVIEWER_API_TOKEN },
+    });
+    if (!res.ok) {
+      console.error('TeamViewer device fetch failed:', res.status);
+      return;
+    }
+    const data = await res.json();
+    tvDevices = Array.isArray(data.devices) ? data.devices : [];
+  } catch (e) {
+    console.error('TeamViewer device fetch error:', e.message);
+  }
+}
+
+function lookupTeamViewer(hostname) {
+  const upper = String(hostname || '').toUpperCase();
+  if (!upper) return null;
+  const match = tvDevices.find((d) => String(d.alias || '').toUpperCase().startsWith(upper));
+  if (!match) return null;
+  return {
+    teamviewer_id: match.teamviewer_id || null,
+    teamviewer_alias: match.alias || null,
+    teamviewer_online: match.online_state || null,
+  };
+}
+
 // A laptop that hasn't reported in this long is shown offline. statusbar.py
 // heartbeats even when nothing changed (see the laptop-side comment), so
 // this only trips on a genuinely stuck/disconnected laptop.
@@ -98,7 +137,11 @@ function snapshot() {
   const now = Date.now();
   const out = {};
   for (const [hostname, data] of laptops) {
-    out[hostname] = { ...data, online: (now - data.lastSeen) < OFFLINE_AFTER_MS };
+    out[hostname] = {
+      ...data,
+      online: (now - data.lastSeen) < OFFLINE_AFTER_MS,
+      ...(lookupTeamViewer(hostname) || {}),
+    };
   }
   return out;
 }
@@ -108,7 +151,7 @@ function broadcastUpdate(hostname) {
   const payload = JSON.stringify({
     type: 'update',
     hostname,
-    data: { ...entry, online: true },
+    data: { ...entry, online: true, ...(lookupTeamViewer(hostname) || {}) },
   });
   for (const ws of dashboards) {
     if (ws.readyState === ws.OPEN) ws.send(payload);
@@ -282,6 +325,9 @@ server.on('upgrade', (req, socket, head) => {
 // (crashed, lost network) flips to "offline" in the UI without waiting
 // for a /report that will never come.
 setInterval(broadcastSnapshot, SNAPSHOT_PUSH_INTERVAL_MS);
+
+refreshTeamViewerDevices();
+setInterval(refreshTeamViewerDevices, TEAMVIEWER_REFRESH_MS);
 
 server.listen(PORT, () => {
   console.log(`gps relay listening on :${PORT}`);
