@@ -222,7 +222,13 @@ const server = http.createServer((req, res) => {
         res.writeHead(400); res.end('missing hostname'); return;
       }
       const { hostname: _drop, ...fields } = payload;
-      laptops.set(hostname, { ...fields, lastSeen: Date.now() });
+      // Merge, don't replace -- statusbar.py (GPS fields, every few
+      // seconds) and update_kiosk.py (version/update fields, every ~2h)
+      // both report under the same hostname key, and a wholesale
+      // replace here would let whichever reports last wipe out the
+      // other's fields.
+      const existing = laptops.get(hostname) || {};
+      laptops.set(hostname, { ...existing, ...fields, lastSeen: Date.now() });
       broadcastUpdate(hostname);
       res.writeHead(204);
       res.end();
