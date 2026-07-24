@@ -245,6 +245,19 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'DELETE' && urlObj.pathname === '/report') {
+    if (!tokenMatches(extractToken(req, urlObj), TOKEN)) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    const hostname = urlObj.searchParams.get('hostname');
+    if (!hostname) { res.writeHead(400); res.end('missing hostname'); return; }
+    laptops.delete(hostname);
+    broadcastSnapshot();
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   res.writeHead(404);
   res.end('not found');
 });
