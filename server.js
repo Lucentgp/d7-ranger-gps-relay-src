@@ -50,6 +50,85 @@ const TEAMVIEWER_API_TOKEN = process.env.TEAMVIEWER_API_TOKEN || null;
 const TEAMVIEWER_REFRESH_MS = 5 * 60 * 1000;
 let tvDevices = [];
 
+// ── Fleet status persistence — this process's `laptops` map is otherwise
+// in-memory only, so a Render redeploy (which restarts the process) wipes
+// every laptop's last-known status, and truly-offline laptops (nothing
+// left to report and repopulate themselves) just vanish from the
+// dashboard instead of showing greyed-out. To survive that, the map is
+// periodically snapshotted to a JSON file in the fleet code repo -- same
+// repo, same token (SENDER_GITHUB_TOKEN) already used for broadcast
+// history, just a different file, so no new secret to configure. This is
+// a durability nice-to-have, not a source of truth: if the token isn't
+// set, everything above still works exactly as before, just without
+// surviving a restart.
+const SNAPSHOT_REPO = 'Lucentgp/NEW-RANGER-LAPTOP-V2';
+const SNAPSHOT_PATH = 'fleet-status-snapshot.json';
+const SNAPSHOT_GITHUB_TOKEN = SENDER_GITHUB_TOKEN;
+const SNAPSHOT_WRITE_INTERVAL_MS = 60 * 1000;
+let snapshotDirty = false;
+
+function snapshotHeaders(extra) {
+  return { Authorization: 'token ' + SNAPSHOT_GITHUB_TOKEN, 'User-Agent': 'gps-relay', ...extra };
+}
+
+async function loadLaptopsSnapshot() {
+  if (!SNAPSHOT_GITHUB_TOKEN) {
+    console.log('No GitHub token configured for fleet snapshot persistence — starting with empty state.');
+    return;
+  }
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${SNAPSHOT_REPO}/contents/${SNAPSHOT_PATH}`,
+      { headers: snapshotHeaders({ Accept: 'application/vnd.github.v3.raw' }) },
+    );
+    if (res.status === 404) {
+      console.log('No fleet snapshot file yet — starting with empty state.');
+      return;
+    }
+    if (!res.ok) {
+      console.error('Fleet snapshot load failed:', res.status);
+      return;
+    }
+    const data = await res.json();
+    let count = 0;
+    for (const [hostname, entry] of Object.entries(data.laptops || {})) {
+      laptops.set(hostname, entry);
+      count++;
+    }
+    console.log(`Loaded fleet snapshot: ${count} laptop(s), saved ${data.savedAt ? new Date(data.savedAt).toISOString() : 'unknown time'}.`);
+  } catch (e) {
+    console.error('Fleet snapshot load error:', e.message);
+  }
+}
+
+async function saveLaptopsSnapshot() {
+  if (!SNAPSHOT_GITHUB_TOKEN || !snapshotDirty) return;
+  snapshotDirty = false; // best-effort persistence, not a source of truth — a failed write below re-dirties it for the next cycle
+  try {
+    const getRes = await fetch(
+      `https://api.github.com/repos/${SNAPSHOT_REPO}/contents/${SNAPSHOT_PATH}`,
+      { headers: snapshotHeaders({ Accept: 'application/vnd.github+json' }) },
+    );
+    const sha = getRes.ok ? (await getRes.json()).sha : undefined;
+    const body = {
+      message: 'Fleet status snapshot (automated)',
+      content: Buffer.from(JSON.stringify({ laptops: Object.fromEntries(laptops), savedAt: Date.now() })).toString('base64'),
+      ...(sha ? { sha } : {}),
+    };
+    const putRes = await fetch(
+      `https://api.github.com/repos/${SNAPSHOT_REPO}/contents/${SNAPSHOT_PATH}`,
+      { method: 'PUT', headers: snapshotHeaders({ 'Content-Type': 'application/json', Accept: 'application/vnd.github+json' }), body: JSON.stringify(body) },
+    );
+    if (!putRes.ok) {
+      console.error('Fleet snapshot save failed:', putRes.status);
+      snapshotDirty = true;
+    }
+  } catch (e) {
+    console.error('Fleet snapshot save error:', e.message);
+    snapshotDirty = true;
+  }
+}
+
 async function refreshTeamViewerDevices() {
   if (!TEAMVIEWER_API_TOKEN) return;
   try {
@@ -306,6 +385,7 @@ const server = http.createServer((req, res) => {
       // other's fields.
       const existing = laptops.get(hostname) || {};
       laptops.set(hostname, { ...existing, ...fields, lastSeen: Date.now() });
+      snapshotDirty = true;
       broadcastUpdate(hostname);
       res.writeHead(204);
       res.end();
@@ -329,6 +409,7 @@ const server = http.createServer((req, res) => {
     const hostname = urlObj.searchParams.get('hostname');
     if (!hostname) { res.writeHead(400); res.end('missing hostname'); return; }
     laptops.delete(hostname);
+    snapshotDirty = true;
     broadcastSnapshot();
     res.writeHead(204);
     res.end();
@@ -381,6 +462,28 @@ setInterval(broadcastSnapshot, SNAPSHOT_PUSH_INTERVAL_MS);
 refreshTeamViewerDevices();
 setInterval(refreshTeamViewerDevices, TEAMVIEWER_REFRESH_MS);
 
-server.listen(PORT, () => {
-  console.log(`gps relay listening on :${PORT}`);
-});
+setInterval(saveLaptopsSnapshot, SNAPSHOT_WRITE_INTERVAL_MS);
+
+// Render sends SIGTERM before killing the old instance on a redeploy --
+// this is the case that actually matters (it's what wiped the fleet map
+// last time), so it gets one last synchronous-ish save attempt instead of
+// waiting for the periodic interval to maybe not fire in time.
+async function shutdown(signal) {
+  console.log(`${signal} received — saving fleet snapshot before exit...`);
+  snapshotDirty = true;
+  try {
+    await saveLaptopsSnapshot();
+  } catch (e) {
+    console.error('Shutdown snapshot save failed:', e.message);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+(async () => {
+  await loadLaptopsSnapshot();
+  server.listen(PORT, () => {
+    console.log(`gps relay listening on :${PORT}`);
+  });
+})();
