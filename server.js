@@ -90,6 +90,40 @@ const MAX_BODY_BYTES = 1_000_000;
 const laptops = new Map();
 const dashboards = new Set();
 
+// Who's-viewing tracking. "name" is self-reported by the browser (typed
+// into the login form) -- there's no per-person auth here, just a shared
+// password, so this is purely for staff visibility ("who's got the
+// dashboard open right now"), not access control. viewerLog is a capped
+// ring buffer of connect/disconnect events; in-memory only, resets on
+// redeploy -- same tradeoff as loginAttempts above, fine for this threat
+// model.
+const MAX_VIEWER_LOG = 300;
+const viewerLog = [];
+
+function pushViewerLog(entry) {
+  viewerLog.push(entry);
+  if (viewerLog.length > MAX_VIEWER_LOG) viewerLog.shift();
+}
+
+function currentViewers() {
+  const out = [];
+  for (const ws of dashboards) {
+    if (ws.viewerMeta) out.push({ ...ws.viewerMeta });
+  }
+  return out;
+}
+
+function broadcastViewers() {
+  const payload = JSON.stringify({
+    type: 'viewers',
+    current: currentViewers(),
+    log: viewerLog.slice(-50).reverse(),
+  });
+  for (const ws of dashboards) {
+    if (ws.readyState === ws.OPEN) ws.send(payload);
+  }
+}
+
 function tokenMatches(supplied, expected) {
   if (!supplied || !expected) return false;
   const a = Buffer.from(supplied);
@@ -313,10 +347,28 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
+  // A name is mandatory -- this also doubles as a forced-logout mechanism:
+  // any tab still running pre-name-field client code (already open before
+  // this deploy) reconnects without a &name= param and gets rejected here,
+  // instead of silently resuming with its old cached token.
+  const name = String(urlObj.searchParams.get('name') || '').trim().slice(0, 60);
+  if (!name) {
+    socket.destroy();
+    return;
+  }
+  const ip = clientIp(req);
+  const userAgent = String(req.headers['user-agent'] || 'unknown').slice(0, 300);
   wss.handleUpgrade(req, socket, head, (ws) => {
+    ws.viewerMeta = { name, ip, userAgent, connectedAt: Date.now() };
     dashboards.add(ws);
+    pushViewerLog({ name, ip, userAgent, event: 'connect', ts: Date.now() });
     ws.send(JSON.stringify({ type: 'snapshot', data: snapshot() }));
-    ws.on('close', () => dashboards.delete(ws));
+    broadcastViewers();
+    ws.on('close', () => {
+      dashboards.delete(ws);
+      pushViewerLog({ name, ip, userAgent, event: 'disconnect', ts: Date.now() });
+      broadcastViewers();
+    });
     ws.on('error', () => dashboards.delete(ws));
   });
 });
