@@ -1,0 +1,53 @@
+name: Publish TeamViewer devices to Firestore
+
+# Replaces server.js's publishTeamViewerDevicesToFirestore() -- this repo
+# still HOLDS the TeamViewer/Firestore secrets (every server-side job
+# needs to live somewhere), it's just GitHub Actions instead of Render.
+# Runs on GitHub's own infrastructure, free, no separate hosting account.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   TEAMVIEWER_API_TOKEN  -- same value already set as a Render env var
+#   FIRESTORE_WRITE_SECRET -- same shared write-gate secret used everywhere else
+
+on:
+  schedule:
+    # Every 5 min, matching the relay's own TEAMVIEWER_REFRESH_MS cadence.
+    # GitHub's scheduler can lag a few minutes under load -- fine here,
+    # same tolerance the existing 5-min server-side refresh already has.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {} # manual "Run workflow" button, for testing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch TeamViewer devices and publish to Firestore
+        env:
+          TEAMVIEWER_API_TOKEN: ${{ secrets.TEAMVIEWER_API_TOKEN }}
+          FIRESTORE_WRITE_SECRET: ${{ secrets.FIRESTORE_WRITE_SECRET }}
+          FIRESTORE_PROJECT_ID: ranger-dashboard-8ba85
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TEAMVIEWER_API_TOKEN:-}" ] || [ -z "${FIRESTORE_WRITE_SECRET:-}" ]; then
+            echo "::error::TEAMVIEWER_API_TOKEN or FIRESTORE_WRITE_SECRET repo secret is not set -- see workflow header for setup." >&2
+            exit 1
+          fi
+
+          devices_json=$(curl -sf -H "Authorization: Bearer ${TEAMVIEWER_API_TOKEN}" \
+            https://webapi.teamviewer.com/api/v1/devices | jq -c '.devices // []')
+
+          now_ms=$(date +%s%3N)
+
+          payload=$(jq -n \
+            --arg devices "$devices_json" \
+            --arg secret "$FIRESTORE_WRITE_SECRET" \
+            --argjson updatedAt "$now_ms" \
+            '{fields: {devices: {stringValue: $devices}, updatedAt: {integerValue: ($updatedAt|tostring)}, secret: {stringValue: $secret}}}')
+
+          curl -sf -X PATCH \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT_ID}/databases/(default)/documents/meta/teamviewer_devices"
+
+          echo "Published $(echo "$devices_json" | jq 'length') device(s) to Firestore."
