@@ -50,6 +50,42 @@ const TEAMVIEWER_API_TOKEN = process.env.TEAMVIEWER_API_TOKEN || null;
 const TEAMVIEWER_REFRESH_MS = 5 * 60 * 1000;
 let tvDevices = [];
 
+// ── Firestore publish (2026-08-27, canary) — the TeamViewer device list
+// itself is not sensitive (it's the same aliases already shown on the
+// public dashboard for every relay-sourced laptop); only fetching it
+// needs the private TEAMVIEWER_API_TOKEN above, which stays server-side
+// here same as always. This just also hands the already-fetched list to
+// Firestore so a laptop that's fully cut over to Firebase (no longer
+// known to this relay at all) can still get a working Remote In button
+// -- the dashboard does the same hostname-prefix match client-side.
+// FIRESTORE_WRITE_SECRET must be set as a Render env var, never
+// committed -- this file is a public repo.
+const FIRESTORE_PROJECT_ID = process.env.FIRESTORE_PROJECT_ID || null;
+const FIRESTORE_WRITE_SECRET = process.env.FIRESTORE_WRITE_SECRET || null;
+
+async function publishTeamViewerDevicesToFirestore() {
+  if (!FIRESTORE_PROJECT_ID || !FIRESTORE_WRITE_SECRET) return; // not configured -- silently skip, same as the snapshot persistence above
+  try {
+    const url = 'https://firestore.googleapis.com/v1/projects/' + FIRESTORE_PROJECT_ID +
+      '/databases/(default)/documents/meta/teamviewer_devices';
+    const body = {
+      fields: {
+        devices: { stringValue: JSON.stringify(tvDevices) },
+        updatedAt: { integerValue: String(Date.now()) },
+        secret: { stringValue: FIRESTORE_WRITE_SECRET },
+      },
+    };
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) console.error('Firestore TeamViewer publish failed:', res.status);
+  } catch (e) {
+    console.error('Firestore TeamViewer publish error:', e.message);
+  }
+}
+
 // ── Fleet status persistence — this process's `laptops` map is otherwise
 // in-memory only, so a Render redeploy (which restarts the process) wipes
 // every laptop's last-known status, and truly-offline laptops (nothing
@@ -141,6 +177,7 @@ async function refreshTeamViewerDevices() {
     }
     const data = await res.json();
     tvDevices = Array.isArray(data.devices) ? data.devices : [];
+    publishTeamViewerDevicesToFirestore();
   } catch (e) {
     console.error('TeamViewer device fetch error:', e.message);
   }
