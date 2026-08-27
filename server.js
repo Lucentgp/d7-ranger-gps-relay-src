@@ -199,7 +199,14 @@ function lookupTeamViewer(hostname) {
 // heartbeats even when nothing changed (see the laptop-side comment), so
 // this only trips on a genuinely stuck/disconnected laptop.
 const OFFLINE_AFTER_MS = 45_000;
-const SNAPSHOT_PUSH_INTERVAL_MS = 10_000;
+// 2026-08-27: was 10_000. Render's free-tier bandwidth cap dropped from
+// 100GB/mo to 5GB/mo in April 2026 -- a full-fleet snapshot rebroadcast
+// to every open dashboard tab every 10s was the single largest bandwidth
+// driver here. 30s cuts that ~3x; a real per-laptop change still pushes
+// immediately via broadcastUpdate() regardless of this interval, this
+// only slows the "nothing changed, resending the whole fleet anyway"
+// cadence.
+const SNAPSHOT_PUSH_INTERVAL_MS = 30_000;
 const MAX_BODY_BYTES = 1_000_000;
 
 // hostname -> latest reported fields + lastSeen (epoch ms)
