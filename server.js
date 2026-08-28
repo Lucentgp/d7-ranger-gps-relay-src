@@ -24,6 +24,28 @@ if (!TOKEN) {
   process.exit(1);
 }
 
+// Phase 3 of the Road Ranger migration (see
+// docs/ranger-migration-plan.md in the inspections repo): forward every
+// /report straight through to the new Cloudflare Worker route too,
+// best-effort, so kiosk_laptops in Supabase starts filling with real
+// fleet data before any laptop is cut over to talk to the Worker
+// directly. Uses the SAME value as TOKEN/RELAY_TOKEN above -- the
+// Worker's FLEET_INGEST_TOKEN secret was deliberately set to this exact
+// value so no new laptop-side or relay-side secret is needed for this.
+// Never awaited from the /report handler and always swallows its own
+// errors: a broken or slow forward must never delay or fail the
+// existing /report response the laptops and dashboard depend on.
+const FLEET_REPORT_FORWARD_URL = process.env.FLEET_REPORT_FORWARD_URL ||
+  'https://rrsp-inspect-api.nshort.workers.dev/fleet/report';
+
+function forwardToFleetWorker(payload) {
+  fetch(FLEET_REPORT_FORWARD_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + TOKEN },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+}
+
 // ── Login endpoints — let the dashboard and message-sender pages hand
 // out their real secrets after a password check instead of shipping
 // those secrets in public page source. Each is optional: if its env var
@@ -429,6 +451,7 @@ const server = http.createServer((req, res) => {
       // other's fields.
       const existing = laptops.get(hostname) || {};
       laptops.set(hostname, { ...existing, ...fields, lastSeen: Date.now() });
+      forwardToFleetWorker({ hostname, ...fields });
       snapshotDirty = true;
       broadcastUpdate(hostname);
       res.writeHead(204);
